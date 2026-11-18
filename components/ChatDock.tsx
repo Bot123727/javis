@@ -4,6 +4,16 @@ import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "
 
 type ChatMessage = { id: string; role: "assistant" | "user"; content: string };
 type Conversation = { id: string; title: string; updatedAt: number; messages: ChatMessage[] };
+type RecognitionResult = { [index: number]: { transcript: string }; isFinal?: boolean };
+type RecognitionEvent = { resultIndex: number; results: { [index: number]: RecognitionResult } };
+type Recognition = {
+  continuous: boolean; interimResults: boolean; lang: string;
+  onresult: ((event: RecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void; stop: () => void;
+};
+type SpeechWindow = Window & { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
 const STORAGE_KEY = "javis.chat.conversations.v1";
 const MEMORY_KEY = "javis.memories.v1";
 const GREETING = "Good to see you. I'm Javis. What can I help you with today?";
@@ -12,7 +22,6 @@ const SUGGESTIONS = ["Help me plan my day", "Summarize my recent emails", "Find 
 function makeConversation(): Conversation {
   return { id: crypto.randomUUID(), title: "New conversation", updatedAt: Date.now(), messages: [{ id: crypto.randomUUID(), role: "assistant", content: GREETING }] };
 }
-
 function loadConversations(): Conversation[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
@@ -21,7 +30,7 @@ function loadConversations(): Conversation[] {
         .map((item) => ({ ...item, messages: item.messages.filter((message: ChatMessage) => message && (message.role === "assistant" || message.role === "user") && typeof message.content === "string") }));
       if (valid.length) return valid.slice(0, 40);
     }
-  } catch { /* Start a fresh local conversation if saved data is malformed. */ }
+  } catch { /* Start a fresh conversation when browser storage is malformed. */ }
   return [makeConversation()];
 }
 
@@ -36,16 +45,20 @@ export function ChatDock() {
   const [error, setError] = useState("");
   const [copiedId, setCopiedId] = useState("");
   const [speakingId, setSpeakingId] = useState("");
+  const [wakeEnabled, setWakeEnabled] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("Voice is off");
   const transcriptRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const loadedRef = useRef(false);
+  const recognitionRef = useRef<Recognition | null>(null);
+  const wakeEnabledRef = useRef(false);
+  const waitingForCommandRef = useRef(false);
+  const speakReplyRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
-    const saved = loadConversations();
-    setConversations(saved);
-    setActiveId(saved[0].id);
-    loadedRef.current = true;
+    const saved = loadConversations(); setConversations(saved); setActiveId(saved[0].id); loadedRef.current = true;
   }, []);
   useEffect(() => {
     if (loadedRef.current && conversations.length) {
@@ -58,22 +71,18 @@ export function ChatDock() {
       if (event.key === "Escape") { setOpen(false); setHistoryOpen(false); }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "j") { event.preventDefault(); setOpen((value) => !value); }
     }
+    function onVoiceRequest() { setOpen(true); enableWakeWord(); }
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+    window.addEventListener("javis:voice", onVoiceRequest);
+    return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("javis:voice", onVoiceRequest); wakeEnabledRef.current = false; recognitionRef.current?.stop(); };
+  });
 
   const active = conversations.find((conversation) => conversation.id === activeId) ?? conversations[0];
   const filtered = useMemo(() => conversations.filter((item) => item.title.toLowerCase().includes(search.toLowerCase())), [conversations, search]);
-
-  function updateActive(transform: (conversation: Conversation) => Conversation) {
-    setConversations((items) => items.map((item) => item.id === activeId ? transform(item) : item));
-  }
+  function updateActive(transform: (conversation: Conversation) => Conversation) { setConversations((items) => items.map((item) => item.id === activeId ? transform(item) : item)); }
   function startNewChat() {
-    abortRef.current?.abort();
-    const conversation = makeConversation();
-    setConversations((items) => [conversation, ...items].slice(0, 40));
-    setActiveId(conversation.id);
-    setInput(""); setError(""); setBusy(false); setOpen(true); setHistoryOpen(false);
+    abortRef.current?.abort(); const conversation = makeConversation(); setConversations((items) => [conversation, ...items].slice(0, 40));
+    setActiveId(conversation.id); setInput(""); setError(""); setBusy(false); setOpen(true); setHistoryOpen(false);
     window.setTimeout(() => inputRef.current?.focus(), 50);
   }
   function deleteConversation(id: string) {
@@ -85,35 +94,80 @@ export function ChatDock() {
     try { const value: unknown = JSON.parse(localStorage.getItem(MEMORY_KEY) ?? "[]"); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").slice(0, 30) : []; }
     catch { return []; }
   }
-
   async function askJavis(messages: ChatMessage[], signal: AbortSignal) {
-    const response = await fetch("/api/chat", {
-      method: "POST", signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: messages.slice(-20).map(({ role, content }) => ({ role, content })), memories: readMemories() })
-    });
+    const response = await fetch("/api/chat", { method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: messages.slice(-20).map(({ role, content }) => ({ role, content })), memories: readMemories() }) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error ?? "Chat request failed.");
     if (typeof result.reply !== "string") throw new Error("Javis returned an unexpected response.");
     return result.reply as string;
   }
+  async function speakText(text: string, id = "voice") {
+    setError(""); setSpeakingId(id);
+    try {
+      const response = await fetch("/api/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      if (!response.ok) { const result = await response.json().catch(() => null); throw new Error(result.error ?? "Voice is not configured."); }
+      if (audioRef.current) { audioRef.current.pause(); if (audioRef.current.src.startsWith("blob:")) URL.revokeObjectURL(audioRef.current.src); }
+      const url = URL.createObjectURL(await response.blob()); const audio = new Audio(url); audioRef.current = audio;
+      audio.onended = () => { URL.revokeObjectURL(url); setSpeakingId(""); };
+      audio.onerror = () => { URL.revokeObjectURL(url); setSpeakingId(""); };
+      await audio.play();
+    } catch (reason) { setSpeakingId(""); setError(reason instanceof Error ? reason.message : "Unable to play ElevenLabs speech. Check your voice settings."); }
+  }
+  function enableWakeWord() {
+    const speechWindow = window as SpeechWindow;
+    const API = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!API) { setVoiceStatus("Voice input needs Chrome or Edge"); setError("This browser does not support voice recognition. Try Chrome or Edge, or type your message."); return; }
+    if (wakeEnabledRef.current) return;
+    wakeEnabledRef.current = true; setWakeEnabled(true); setOpen(true); setError("");
+    const listen = () => {
+      if (!wakeEnabledRef.current) return;
+      const recognition = new API(); recognitionRef.current = recognition;
+      recognition.lang = "en-US"; recognition.continuous = true; recognition.interimResults = false;
+      recognition.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript.trim();
+          if (!transcript) continue;
+          const wakeMatch = transcript.match(/\bhey\s+javis\b[\s,.:;!?-]*(.*)/i);
+          if (wakeMatch) {
+            setOpen(true);
+            const command = wakeMatch[1].trim();
+            if (command) { waitingForCommandRef.current = false; setVoiceStatus("Sending your request…"); void submitText(command, undefined, true); }
+            else { waitingForCommandRef.current = true; setVoiceStatus("I’m listening — what can I do for you?"); }
+          } else if (waitingForCommandRef.current) {
+            waitingForCommandRef.current = false; setVoiceStatus("Sending your request…"); void submitText(transcript, undefined, true);
+          }
+        }
+      };
+      recognition.onerror = (event) => {
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") { wakeEnabledRef.current = false; setWakeEnabled(false); setVoiceStatus("Microphone permission blocked"); setError("Allow microphone access in browser settings to use Hey Javis voice input."); }
+        else if (event.error !== "no-speech" && event.error !== "aborted") setVoiceStatus("Voice paused — tap the mic to retry");
+      };
+      recognition.onend = () => {
+        if (wakeEnabledRef.current) window.setTimeout(listen, 350);
+        else setVoiceStatus("Voice is off");
+      };
+      try { recognition.start(); setVoiceStatus(waitingForCommandRef.current ? "Listening for your request…" : "Listening for “Hey Javis”…"); }
+      catch { setVoiceStatus("Voice paused — tap the mic to retry"); }
+    };
+    listen();
+  }
+  function disableWakeWord() {
+    wakeEnabledRef.current = false; waitingForCommandRef.current = false; setWakeEnabled(false); setVoiceStatus("Voice is off"); recognitionRef.current?.stop();
+  }
+  function toggleWakeWord() { if (wakeEnabledRef.current) disableWakeWord(); else enableWakeWord(); }
 
-  async function submitText(text: string, event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    const value = text.trim();
+  async function submitText(text: string, event?: FormEvent<HTMLFormElement>, speakReply = false) {
+    event?.preventDefault(); const value = text.trim();
     if (!value || busy || !active) return;
     setInput(""); setError(""); setOpen(true); setHistoryOpen(false);
-
     const rememberMatch = value.match(/^remember(?: that)?\s+(.+)$/i);
     if (rememberMatch) {
       const fact = rememberMatch[1].trim().replace(/[.!?]+$/, "").slice(0, 300);
       if (fact) {
-        try {
-          const current = readMemories();
-          localStorage.setItem(MEMORY_KEY, JSON.stringify([...current.filter((item) => item.toLowerCase() !== fact.toLowerCase()), fact].slice(-30)));
-          const next = [...active.messages, { id: crypto.randomUUID(), role: "user" as const, content: value }, { id: crypto.randomUUID(), role: "assistant" as const, content: `Got it — I’ll remember “${fact}” in this browser.` }];
-          updateActive((conversation) => ({ ...conversation, title: conversation.title === "New conversation" ? value.slice(0, 42) : conversation.title, messages: next, updatedAt: Date.now() }));
-        } catch { setError("Could not save memory in this browser."); }
+        try { const current = readMemories(); localStorage.setItem(MEMORY_KEY, JSON.stringify([...current.filter((item) => item.toLowerCase() !== fact.toLowerCase()), fact].slice(-30))); }
+        catch { setError("Could not save memory in this browser."); }
+        const next = [...active.messages, { id: crypto.randomUUID(), role: "user" as const, content: value }, { id: crypto.randomUUID(), role: "assistant" as const, content: `Got it — I’ll remember “${fact}” in this browser.` }];
+        updateActive((conversation) => ({ ...conversation, title: conversation.title === "New conversation" ? value.slice(0, 42) : conversation.title, messages: next, updatedAt: Date.now() }));
       }
       return;
     }
@@ -122,85 +176,47 @@ export function ChatDock() {
       updateActive((conversation) => ({ ...conversation, messages: [...conversation.messages, { id: crypto.randomUUID(), role: "user", content: value }, { id: crypto.randomUUID(), role: "assistant", content: "I cleared the memories saved in this browser." }], updatedAt: Date.now() }));
       return;
     }
-
-    const conversationId = active.id;
-    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: value };
-    const thread = [...active.messages, userMessage];
+    const conversationId = active.id; const userMessage: ChatMessage = { id: crypto.randomUUID(), role: "user", content: value }; const thread = [...active.messages, userMessage];
     updateActive((conversation) => ({ ...conversation, title: conversation.title === "New conversation" ? value.replace(/\s+/g, " ").slice(0, 42) : conversation.title, messages: thread, updatedAt: Date.now() }));
     const controller = new AbortController(); abortRef.current = controller; setBusy(true);
     try {
       const reply = await askJavis(thread, controller.signal);
-      setConversations((items) => items.map((item) => item.id === conversationId ? { ...item, messages: [...item.messages, { id: crypto.randomUUID(), role: "assistant", content: reply }], updatedAt: Date.now() } : item));
-    } catch (reason) {
-      if (reason instanceof Error && reason.name !== "AbortError") setError(reason.message);
-    } finally { if (abortRef.current === controller) { abortRef.current = null; setBusy(false); } }
-  }
-
-  async function retryLast() {
-    if (busy || !active) return;
-    const lastUserIndex = active.messages.map((item) => item.role).lastIndexOf("user");
-    if (lastUserIndex < 0) return;
-    const thread = active.messages.slice(0, lastUserIndex + 1);
-    updateActive((conversation) => ({ ...conversation, messages: thread, updatedAt: Date.now() }));
-    const controller = new AbortController(); abortRef.current = controller; setBusy(true); setError("");
-    try {
-      const reply = await askJavis(thread, controller.signal);
-      setConversations((items) => items.map((item) => item.id === active.id ? { ...item, messages: [...thread, { id: crypto.randomUUID(), role: "assistant", content: reply }], updatedAt: Date.now() } : item));
+      const assistantMessage: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: reply };
+      setConversations((items) => items.map((item) => item.id === conversationId ? { ...item, messages: [...item.messages, assistantMessage], updatedAt: Date.now() } : item));
+      if (speakReply) { setVoiceStatus("Javis is speaking"); await speakText(reply, assistantMessage.id); setVoiceStatus(wakeEnabledRef.current ? "Listening for “Hey Javis”…" : "Voice reply complete"); }
     } catch (reason) { if (reason instanceof Error && reason.name !== "AbortError") setError(reason.message); }
     finally { if (abortRef.current === controller) { abortRef.current = null; setBusy(false); } }
   }
-
-  function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
+  async function retryLast() {
+    if (busy || !active) return; const index = active.messages.map((item) => item.role).lastIndexOf("user"); if (index < 0) return;
+    const thread = active.messages.slice(0, index + 1); updateActive((conversation) => ({ ...conversation, messages: thread, updatedAt: Date.now() }));
+    const controller = new AbortController(); abortRef.current = controller; setBusy(true); setError("");
+    try { const reply = await askJavis(thread, controller.signal); setConversations((items) => items.map((item) => item.id === active.id ? { ...item, messages: [...thread, { id: crypto.randomUUID(), role: "assistant", content: reply }], updatedAt: Date.now() } : item)); }
+    catch (reason) { if (reason instanceof Error && reason.name !== "AbortError") setError(reason.message); }
+    finally { if (abortRef.current === controller) { abortRef.current = null; setBusy(false); } }
   }
-  async function copyMessage(message: ChatMessage) {
-    try { await navigator.clipboard.writeText(message.content); setCopiedId(message.id); window.setTimeout(() => setCopiedId(""), 1400); }
-    catch { setError("Clipboard access is unavailable in this browser."); }
-  }
-  async function speak(message: ChatMessage) {
-    setError(""); setSpeakingId(message.id);
-    try {
-      const response = await fetch("/api/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: message.content }) });
-      if (!response.ok) { const result = await response.json().catch(() => null); throw new Error(result?.error ?? "Voice is not configured."); }
-      const audioUrl = URL.createObjectURL(await response.blob());
-      const audio = new Audio(audioUrl);
-      audio.onended = () => { URL.revokeObjectURL(audioUrl); setSpeakingId(""); };
-      audio.onerror = () => { URL.revokeObjectURL(audioUrl); setSpeakingId(""); };
-      await audio.play();
-    } catch (reason) { setSpeakingId(""); setError(reason instanceof Error ? reason.message : "Unable to play speech."); }
-  }
+  function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }
+  async function copyMessage(message: ChatMessage) { try { await navigator.clipboard.writeText(message.content); setCopiedId(message.id); window.setTimeout(() => setCopiedId(""), 1400); } catch { setError("Clipboard access is unavailable in this browser."); } }
+  async function speak(message: ChatMessage) { await speakText(message.content, message.id); }
   function editMessage(message: ChatMessage) { setInput(message.content); inputRef.current?.focus(); }
-  function clearConversation() {
-    if (!active) return;
-    updateActive((conversation) => ({ ...conversation, title: "New conversation", messages: [{ id: crypto.randomUUID(), role: "assistant", content: GREETING }], updatedAt: Date.now() }));
-    setError("");
-  }
+  function clearConversation() { if (active) updateActive((conversation) => ({ ...conversation, title: "New conversation", messages: [{ id: crypto.randomUUID(), role: "assistant", content: GREETING }], updatedAt: Date.now() })); setError(""); }
 
   if (!active) return null;
-  return (
-    <>
-      {!open && <button className="javis-launcher" onClick={() => setOpen(true)} aria-label="Open Javis chat"><img src="/javis-logo.svg" alt="" /><span>CHAT WITH JAVIS</span><i /></button>}
-      {open && <aside className="javis-chat" aria-label="Javis chat">
-        <header className="javis-chat-header"><img src="/javis-logo.svg" alt="" /><div><strong>Javis</strong><small>PERSONAL AI ASSISTANT</small></div><button onClick={startNewChat} title="New chat" aria-label="New chat">＋</button><button onClick={() => setHistoryOpen((value) => !value)} title="Conversation history" aria-label="Conversation history" aria-pressed={historyOpen}>◷</button><button onClick={() => setOpen(false)} title="Minimize chat" aria-label="Minimize chat">−</button></header>
-        <div className="javis-chat-layout">
-          {historyOpen && <section className="javis-history" aria-label="Conversation history"><div className="history-heading"><strong>History</strong><button onClick={startNewChat}>＋ New</button></div><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search conversations" aria-label="Search conversations" />
-            <div className="history-list">{filtered.map((conversation) => <div key={conversation.id} className={`history-item ${conversation.id === active.id ? "active" : ""}`}><button className="history-select" onClick={() => { setActiveId(conversation.id); setError(""); setHistoryOpen(false); }}>{conversation.title}<small>{new Date(conversation.updatedAt).toLocaleDateString()}</small></button><button className="history-delete" onClick={() => deleteConversation(conversation.id)} aria-label={`Delete ${conversation.title}`}>×</button></div>)}{filtered.length === 0 && <p className="history-empty">No matching conversations.</p>}</div>
-          </section>}
-          <div className="javis-chat-main">
-            <div className="javis-chat-toolbar"><span><i /> {statusLabel(busy)}</span><button onClick={clearConversation} title="Clear this chat">CLEAR CHAT</button></div>
-            <div className="javis-transcript" ref={transcriptRef} aria-live="polite">
-              {active.messages.map((message, index) => <article key={message.id} className={`javis-message ${message.role}`}><div className="javis-bubble">{message.content}</div><div className="message-tools">{message.role === "user" && <button onClick={() => editMessage(message)} title="Edit message">EDIT</button>}{message.role === "assistant" && <><button onClick={() => void copyMessage(message)} title="Copy response">{copiedId === message.id ? "COPIED" : "COPY"}</button><button onClick={() => void speak(message)} title="Read response aloud">{speakingId === message.id ? "PLAYING" : "SPEAK"}</button>{index === active.messages.length - 1 && <button onClick={retryLast} title="Regenerate response">RETRY</button>}</>}</div></article>)}
-              {active.messages.length === 1 && <div className="javis-suggestions"><span>START WITH</span>{SUGGESTIONS.map((suggestion) => <button key={suggestion} onClick={() => void submitText(suggestion)}>{suggestion} <b>↗</b></button>)}</div>}
-              {busy && <div className="javis-thinking"><i /><i /><i /> Javis is thinking…</div>}
-            </div>
-            {error && <div className="javis-error" role="alert">{error}<button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
-            <form className="javis-composer" onSubmit={(event) => void submitText(input, event)}><textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onComposerKeyDown} placeholder="Message Javis… (Shift+Enter for a new line)" aria-label="Message Javis" rows={2} /><div><small>ENTER SENDS · SHIFT+ENTER ADDS A LINE</small><button type="button" className="cancel-button" onClick={() => { abortRef.current?.abort(); setBusy(false); }} disabled={!busy}>STOP</button><button className="javis-send" type="submit" disabled={!input.trim() || busy} aria-label="Send message">↑</button></div></form>
-            <footer className="javis-chat-footer"><span>YOUR CHATS SAVE IN THIS BROWSER</span><kbd>⌘/CTRL + J</kbd></footer>
-          </div>
+  return <>
+    {!open && <button className="javis-launcher" onClick={() => setOpen(true)} aria-label="Open Javis chat"><img src="/javis-logo.svg" alt="" /><span>CHAT WITH JAVIS</span><i /></button>}
+    {open && <aside className="javis-chat" aria-label="Javis chat">
+      <header className="javis-chat-header"><img src="/javis-logo.svg" alt="" /><div><strong>Javis</strong><small>PERSONAL AI ASSISTANT</small></div><button onClick={startNewChat} title="New chat" aria-label="New chat">＋</button><button onClick={() => setHistoryOpen((value) => !value)} title="Conversation history" aria-label="Conversation history" aria-pressed={historyOpen}>◷</button><button onClick={() => setOpen(false)} title="Minimize chat" aria-label="Minimize chat">−</button></header>
+      <div className="javis-chat-layout">
+        {historyOpen && <section className="javis-history" aria-label="Conversation history"><div className="history-heading"><strong>History</strong><button onClick={startNewChat}>＋ New</button></div><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search conversations" aria-label="Search conversations" /><div className="history-list">{filtered.map((conversation) => <div key={conversation.id} className={`history-item ${conversation.id === active.id ? "active" : ""}`}><button className="history-select" onClick={() => { setActiveId(conversation.id); setError(""); setHistoryOpen(false); }}>{conversation.title}<small>{new Date(conversation.updatedAt).toLocaleDateString()}</small></button><button className="history-delete" onClick={() => deleteConversation(conversation.id)} aria-label={`Delete ${conversation.title}`}>×</button></div>)}{filtered.length === 0 && <p className="history-empty">No matching conversations.</p>}</div></section>}
+        <div className="javis-chat-main">
+          <div className="javis-chat-toolbar"><span><i /> {busy ? "THINKING" : "READY TO HELP"}</span><button onClick={clearConversation} title="Clear this chat">CLEAR CHAT</button></div>
+          {wakeEnabled && <div className="voice-status" role="status"><span className="voice-wave"><i /><i /><i /><i /></span>{voiceStatus}<button onClick={disableWakeWord}>TURN OFF</button></div>}
+          <div className="javis-transcript" ref={transcriptRef} aria-live="polite">{active.messages.map((message, index) => <article key={message.id} className={`javis-message ${message.role}`}><div className="javis-bubble">{message.content}</div><div className="message-tools">{message.role === "user" && <button onClick={() => editMessage(message)} title="Edit message">EDIT</button>}{message.role === "assistant" && <><button onClick={() => void copyMessage(message)} title="Copy response">{copiedId === message.id ? "COPIED" : "COPY"}</button><button onClick={() => void speak(message)} title="Read response aloud">{speakingId === message.id ? "PLAYING" : "SPEAK"}</button>{index === active.messages.length - 1 && <button onClick={retryLast} title="Regenerate response">RETRY</button>}</>}</div></article>)}{active.messages.length === 1 && <div className="javis-suggestions"><span>START WITH</span>{SUGGESTIONS.map((suggestion) => <button key={suggestion} onClick={() => void submitText(suggestion)}>{suggestion} <b>↗</b></button>)}</div>}{busy && <div className="javis-thinking"><i /><i /><i /> Javis is thinking…</div>}</div>
+          {error && <div className="javis-error" role="alert">{error}<button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
+          <form className="javis-composer" onSubmit={(event) => void submitText(input, event)}><textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onComposerKeyDown} placeholder="Message Javis… (Shift+Enter for a new line)" aria-label="Message Javis" rows={2} /><div><small>ENTER SENDS · SHIFT+ENTER ADDS A LINE</small><button type="button" className="voice-mic-button" onClick={toggleWakeWord} aria-label={wakeEnabled ? "Turn off Hey Javis voice" : "Enable Hey Javis voice input"} title="Enable microphone and say Hey Javis">{wakeEnabled ? "◉ LISTENING" : "🎙 VOICE"}</button><button type="button" className="cancel-button" onClick={() => { abortRef.current?.abort(); setBusy(false); }} disabled={!busy}>STOP</button><button className="javis-send" type="submit" disabled={!input.trim() || busy} aria-label="Send message">↑</button></div></form>
+          <footer className="javis-chat-footer"><span>CHATS SAVE IN THIS BROWSER</span><kbd>⌘/CTRL + J</kbd></footer>
         </div>
-      </aside>}
-    </>
-  );
+      </div>
+    </aside>}
+  </>;
 }
-
-function statusLabel(busy: boolean) { return busy ? "THINKING" : "READY TO HELP"; }
