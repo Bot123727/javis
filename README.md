@@ -1,30 +1,24 @@
 # Javis
 
-Javis is a personal assistant web app with a HUD-style command center, floating chat, browser-local memory, and optional Microsoft Outlook/OneNote and ElevenLabs connections.
+Javis is a personal assistant web app with a HUD-style command center and floating chat. Chat history is saved in this browser; the assistant can use OpenAI, optional read-only Outlook/OneNote access, and ElevenLabs speech when configured.
 
 ## Run locally
 
 ```bash
 npm install
 cp .env.example .env.local
-# Configure the values you need in .env.local
+# Configure credentials needed for the integrations you plan to use
 npm run dev
 ```
 
 Open <http://localhost:3000>.
 
-## Welcome and logo
+## Interactive chat
 
-On launch, Javis shows the supplied Javis logo as an animated splash, followed by a text greeting in the chat. The logo recreation is in `public/javis-logo.svg`. Turn **SOUND ON** to hear ElevenLabs' greeting. Browsers generally block audio on page load until you interact; enabling sound is the required user gesture, and if playback is blocked, click **Play greeting** in the chat.
+Open the bottom-right Javis launcher (or press **Ctrl/⌘ + J**). Start chats, browse/search/delete conversation history, clear a chat, copy or edit a message, retry the latest answer, stop an in-flight request, and use suggested prompts. Press Enter to send and Shift+Enter for a new line. Chats persist in this browser's local storage; they are not synced across devices. The API key is server-side; set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` for AI replies.
 
-## AI and speech
+Say `remember that ...` to save a fact in browser memory, or `clear my memory` to remove it. Memories are stored locally and are not encrypted; do not save sensitive information.
 
-Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` (default `gpt-4o-mini`) for AI chat. Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` for speech. Secrets stay server-side.
+## Optional connections
 
-## Outlook and OneNote
-
-Configure Microsoft Entra credentials in `.env.local`, register `http://localhost:3000/api/auth/callback/azure-ad` as a Web redirect URI, and grant delegated `User.Read`, `Mail.Read`, and `Notes.Read` permissions. Select **Connect Microsoft** to sign in and consent. Javis only reads mail and notes when asked; it does not send, edit, or delete them. Relevant excerpts are sent to the configured AI provider to answer the request.
-
-## Memory and privacy
-
-Say `remember that ...` to save a fact in this browser's local storage. Memories can be reviewed and cleared in chat. They are not encrypted or synced, so don't store passwords or sensitive information. Clear them on shared devices.
+For ElevenLabs, set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`. For Microsoft sign-in, register `http://localhost:3000/api/auth/callback/azure-ad` as an Entra Web redirect and configure the Azure credentials, `NEXTAUTH_URL`, and `NEXTAUTH_SECRET`. Grant the delegated `User.Read`, `Mail.Read`, and `Notes.Read` Graph permissions. Javis only reads Outlook mail and OneNote pages when asked; it does not send, edit, or delete them.
