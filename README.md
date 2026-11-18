@@ -1,7 +1,12 @@
-# Javis
+# Javis AI
 
-Javis is a personal assistant web app with a sci-fi inspired command center and a dedicated chat dock. The interface is based on the visual reference: a dark HUD, cyan radar core, system readouts, and a compact assistant conversation panel.
+Javis is an advanced personal AI assistant designed to bring intelligent assistance, productivity and technology together in one powerful platform.
 
+Featuring a futuristic sci-fi inspired command centre, Javis combines a sleek dark interface with electric-blue and cyan accents, a central interactive radar core, real-time system readouts and a dedicated AI chat dock.
+
+Built to feel like a next-generation AI operating system, Javis provides users with a central place to interact with their assistant, access tools, manage tasks and control their digital workspace.
+
+**Javis — Your Personal AI Command Centre.**
 ## Run locally
 
 ```bash
